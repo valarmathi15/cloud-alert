@@ -289,7 +289,8 @@ def stop_bot(reason, action_ts=None):
 # ---------- scan / loop ----------
 def scan(force=False):
     """One pass over every selected index x timeframe.
-    Every scan sends a notification saying whether the price is IN or NOT IN each selected zone."""
+    Auto scan (Start alerts): sends a notification saying whether the price is IN or NOT IN each
+    selected zone, and logs it.  force=True (Check now): only refreshes the dashboard table."""
     cfg = load_json(CONFIG_FILE, DEFAULT_CFG)
     near_pct = int(cfg.get("near_pct", 1))
     near = near_pct / 100
@@ -319,27 +320,27 @@ def scan(force=False):
 
             matched = zone in cfg["zones"]
             msg = build_message(name, tf, price, top, bottom, zone, cfg["zones"], near_pct)
-            if force:
-                msg = "🔎 MANUAL CHECK\n" + msg
             if not market_open:
                 msg += "\n(market closed - last close price)"
             alerts.append(msg)
             status = zone_status(zone, cfg["zones"], near_pct)
-            row["alerted"], row["matched"], row["status"] = True, matched, status
+            row["alerted"], row["matched"], row["status"], row["manual"] = (not force), matched, status, force
             log_entries.append({
                 "sent_unix": sent_ts, "sent_at": fmt_ist(sent_ts), "index": name,
                 "tf": tf, "zone": zone, "price": price, "matched": matched, "status": status,
                 "kind": "manual" if force else "auto",
                 "action_unix": None, "action_at": None})
 
-    if alerts:  # one combined notification per scan
+    if alerts and not force:  # one combined notification per auto scan
         send_alert("\n\n".join(alerts))
         log_notifications(log_entries)
     bot["rows"], bot["last_scan"] = rows, now.strftime("%d %b %H:%M:%S")
 
 
 def monitor_loop():
+    """Auto alerts: one scan + notification every CHECK_EVERY_SECONDS until stopped."""
     while bot["running"]:
+        cycle_start = time.time()
         if check_action_taken_signal():
             stop_bot("signal file", time.time())
             break
@@ -352,11 +353,11 @@ def monitor_loop():
             scan()
         except Exception as e:
             print("scan error:", e)
-        waited = 0
-        while bot["running"] and waited < CHECK_EVERY_SECONDS:
+        last_poll = time.time()
+        while bot["running"] and time.time() - cycle_start < CHECK_EVERY_SECONDS:
             time.sleep(1)
-            waited += 1
-            if waited % STOP_POLL_SECONDS == 0 and NTFY_TOPICS:
+            if NTFY_TOPICS and time.time() - last_poll >= STOP_POLL_SECONDS:
+                last_poll = time.time()
                 ts = ntfy_stop_requested(bot["since"])
                 if ts:
                     stop_bot("action taken", ts)
@@ -519,6 +520,8 @@ with tab_dash:
                 continue
             if r.get("alerted"):
                 alert = "Sent - in selected zone" if r.get("matched") else "Sent - not in selected zone"
+            elif r.get("manual"):
+                alert = "Checked only (no notification)"
             else:
                 alert = "Watching"
             data.append({
@@ -547,8 +550,8 @@ with tab_log:
         data = []
         for e in reversed(log):
             if e.get("kind") == "manual":
-                action, at = "- (manual check)", "-"
-            elif e.get("action_at"):
+                continue  # manual checks are not notifications
+            if e.get("action_at"):
                 action, at = "Yes", e["action_at"]
             elif bot["running"] and e.get("sent_unix", 0) >= bot["since"]:
                 action, at = "Pending", "-"
@@ -561,10 +564,12 @@ with tab_log:
                 "Selected zone": e.get("status") or ZONES.get(e.get("zone"), e.get("zone")),
                 "In selected zone": "Yes" if e.get("matched", True) else "No",
                 "Price": e.get("price"),
-                "Type": "Manual check" if e.get("kind") == "manual" else "Auto",
                 "Action taken": action,
                 "Action time (IST)": at,
             })
+        if not data:
+            st.info("Innum notification poga-la. Start alerts click pannina piragu inga varum.")
+            return
         df = pd.DataFrame(data)
         st.caption(f"{len(df)} notifications saved (newest first)")
         st.dataframe(df.style.format({"Price": lambda v: f"{v:,.2f}" if isinstance(v, (int, float)) else v}),
