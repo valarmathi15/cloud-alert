@@ -319,63 +319,50 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---- keep every checkbox value alive across reruns (even when its row is hidden) ----
+# ---- session defaults come from the saved config ----
 saved = load_json(CONFIG_FILE, DEFAULT_CFG)
-saved_segments = saved.get("segments") or sorted({SEGMENT_OF[i] for i in saved.get("indices", []) if i in SEGMENT_OF}) or ["NSE"]
+saved_segments = saved.get("segments") or sorted(
+    {SEGMENT_OF[i] for i in saved.get("indices", []) if i in SEGMENT_OF}) or ["NSE"]
 
 
 def keep(key, default):
     st.session_state[key] = st.session_state.get(key, default)
 
 
-for s_ in SEGMENTS:
-    keep(f"seg_{s_}", s_ in saved_segments)
-for n_ in INDICES:
-    keep(f"idx_{n_}", n_ in saved.get("indices", []))
-for t_ in TFS:
-    keep(f"tf_{t_}", t_ in saved.get("timeframes", []))
-for z_ in ZONES:
-    keep(f"zn_{z_}", z_ in saved.get("zones", []))
 try:
     _np = min(10, max(1, int(saved.get("near_pct", 1))))
 except Exception:
     _np = 1
+keep("sel_segments", [x for x in saved_segments if x in SEGMENTS])
+keep("sel_indices", [x for x in saved.get("indices", []) if x in INDICES])
+keep("sel_tfs", [x for x in saved.get("timeframes", []) if x in TFS])
+keep("sel_zones", [x for x in saved.get("zones", []) if x in ZONES])
 keep("near_pct", _np)
 
-
-def checkbox_row(items, prefix):
-    cols = st.columns(len(items))
-    for col, (k, label) in zip(cols, items):
-        col.checkbox(label, key=f"{prefix}_{k}")
-
-
 with st.container(border=True):
-    st.markdown("**Segment**")
-    checkbox_row([(s, s) for s in SEGMENTS], "seg")
-    sel_segments = [s for s in SEGMENTS if st.session_state[f"seg_{s}"]]
+    # four dropdowns side by side (each has a built-in "Select all" in its list)
+    c_seg, c_idx, c_tf, c_zn, c_np = st.columns([1, 2, 1.3, 1.7, 0.9])
 
-    st.markdown("**Index**")
-    if not sel_segments:
-        st.caption("Select a segment first (NSE / BSE).")
-    for seg in sel_segments:
-        st.caption(seg)
-        checkbox_row([(n, n) for n in INDICES_BY_SEGMENT[seg]], "idx")
+    c_seg.multiselect("Segment", SEGMENTS, key="sel_segments", placeholder="Choose segment")
 
-    st.markdown("**Timeframe**")
-    checkbox_row([(k, v) for k, v in TFS.items()], "tf")
+    idx_options = [n for n in INDICES if SEGMENT_OF[n] in st.session_state["sel_segments"]]
+    # drop picks that belong to a segment that is no longer selected
+    st.session_state["sel_indices"] = [i for i in st.session_state["sel_indices"] if i in idx_options]
+    c_idx.multiselect("Index", idx_options, key="sel_indices", placeholder="Choose index")
 
-    st.markdown("**Cloud (alert me only when price is)**")
-    checkbox_row([(k, v) for k, v in ZONES.items()], "zn")
-
-    st.markdown("**Target % (how close is \"Near Cloud Top / Bottom\")**")
-    st.radio("Target %", list(range(1, 11)), key="near_pct", horizontal=True,
-             format_func=lambda x: f"{x}%", label_visibility="collapsed")
+    c_tf.multiselect("Timeframe", list(TFS.keys()), key="sel_tfs",
+                     format_func=lambda x: TFS[x], placeholder="Choose timeframe")
+    c_zn.multiselect("Cloud (alert only when price is)", list(ZONES.keys()), key="sel_zones",
+                     format_func=lambda x: ZONES[x], placeholder="Choose cloud zone")
+    c_np.selectbox("Target %", list(range(1, 11)), key="near_pct",
+                   format_func=lambda x: f"{x}%",
+                   help='How close to the cloud line counts as "Near Cloud Top / Bottom"')
 
     cfg = {
-        "segments": sel_segments,
-        "indices": [n for n in INDICES if SEGMENT_OF[n] in sel_segments and st.session_state[f"idx_{n}"]],
-        "timeframes": [t for t in TFS if st.session_state[f"tf_{t}"]],
-        "zones": [z for z in ZONES if st.session_state[f"zn_{z}"]],
+        "segments": st.session_state["sel_segments"],
+        "indices": st.session_state["sel_indices"],
+        "timeframes": st.session_state["sel_tfs"],
+        "zones": st.session_state["sel_zones"],
         "near_pct": int(st.session_state["near_pct"]),
     }
     ok = bool(cfg["indices"] and cfg["timeframes"] and cfg["zones"])
