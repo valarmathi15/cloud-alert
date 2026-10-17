@@ -41,7 +41,7 @@ DEFAULT_CFG = {"indices": ["Nifty 50"], "timeframes": ["4h"], "zones": ["above",
 # State must survive Streamlit reruns -> keep it in cache_resource
 @st.cache_resource(show_spinner=False)
 def get_shared():
-    return {"bot": {"running": False, "last_scan": None, "rows": [], "test_mode": False, "ignore_hours": False},
+    return {"bot": {"running": False, "last_scan": None, "rows": [], "test_mode": False, "ignore_hours": True},
             "lock": threading.Lock()}
 
 
@@ -225,7 +225,7 @@ def scan(force=False):
             print(f"[{key}] price={price} cloud=({bottom:.2f}-{top:.2f}) zone={zone} changed={changed}")
 
             if market_open or test or any_hours or force:
-                if test or (zone in cfg["zones"] and (force or changed or due)):
+                if test or (zone in cfg["zones"] and (force or any_hours or changed or due)):
                     msg = MESSAGES[zone].format(name=name, tf=tf.upper(), price=price,
                                                 cloud_top=round(top, 2), cloud_bottom=round(bottom, 2),
                                                 pct=int(NEAR_PCT * 100))
@@ -314,8 +314,8 @@ with st.container(border=True):
         value=bot.get("test_mode", False))
 
     bot["ignore_hours"] = st.checkbox(
-        "Send auto alerts even when market is closed (Start alerts mode)",
-        value=bot.get("ignore_hours", False))
+        "Repeat: send notification every 5 min until I press Stop (ignores market hours)",
+        value=bot.get("ignore_hours", True))
 
     if active_channels():
         st.caption("Alert channel: " + ", ".join(active_channels()))
