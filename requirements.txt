@@ -1,0 +1,5 @@
+streamlit
+flask
+yfinance
+pandas
+pywhatkit
