@@ -7,6 +7,7 @@ Cloud run :  requirements.txt = streamlit, yfinance, pandas
              (dashboard works; WhatsApp via pywhatkit only works on a PC with Chrome + WhatsApp Web)
 """
 import os, json, time, datetime, threading
+import requests
 import pandas as pd
 import yfinance as yf
 import streamlit as st
@@ -42,13 +43,32 @@ DEFAULT_CFG = {"indices": ["Nifty 50"], "timeframes": ["4h"], "zones": ["above",
 # State must survive Streamlit reruns -> keep it in cache_resource
 @st.cache_resource(show_spinner=False)
 def get_shared():
-    return {"bot": {"running": False, "last_scan": None, "rows": []},
+    return {"bot": {"running": False, "last_scan": None, "rows": [], "test_mode": False, "ignore_hours": False},
             "lock": threading.Lock()}
 
 
 _shared = get_shared()
 bot = _shared["bot"]
 send_lock = _shared["lock"]
+
+
+def _secret(name, default=""):
+    v = os.environ.get(name)
+    if v:
+        return v
+    try:
+        return str(st.secrets[name])
+    except Exception:
+        return default
+
+
+# Cloud-friendly alert channels (set in Streamlit "Secrets"; see instructions)
+TELEGRAM_BOT_TOKEN = _secret("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_IDS = [x.strip() for x in _secret("TELEGRAM_CHAT_IDS").split(",") if x.strip()]
+# NTFY_TOPIC: plain phone push notification (install the free "ntfy" app and subscribe to the same topic)
+NTFY_TOPICS = [x.strip() for x in _secret("NTFY_TOPIC").split(",") if x.strip()]
+# CALLMEBOT_KEYS format:  "+9190000000:apikey1,+9180000000:apikey2"
+CALLMEBOT_KEYS = [x.strip() for x in _secret("CALLMEBOT_KEYS").split(",") if ":" in x]
 
 
 def now_ist():
@@ -147,7 +167,7 @@ MESSAGES = {
 }
 
 
-def send_whatsapp(message):
+def send_pywhatkit(message):
     def worker():
         with send_lock:  # pywhatkit is slow, so send one message at a time
             send_time = datetime.datetime.now() + datetime.timedelta(minutes=3)
@@ -161,15 +181,66 @@ def send_whatsapp(message):
     threading.Thread(target=worker, daemon=True).start()
 
 
+def active_channels():
+    ch = []
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS:
+        ch.append(f"Telegram ({len(TELEGRAM_CHAT_IDS)} chat)")
+    if CALLMEBOT_KEYS:
+        ch.append(f"WhatsApp-CallMeBot ({len(CALLMEBOT_KEYS)} number)")
+    if NTFY_TOPICS:
+        ch.append("Phone notification (ntfy)")
+    return ch
+
+
+def send_alert(message):
+    """Cloud channels if configured, otherwise fall back to pywhatkit (local PC only)."""
+    def worker():
+        for cid in TELEGRAM_CHAT_IDS if TELEGRAM_BOT_TOKEN else []:
+            try:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    data={"chat_id": cid, "text": message}, timeout=20)
+                print("Telegram", cid, r.status_code)
+            except Exception as e:
+                print("Telegram error:", e)
+        for topic in NTFY_TOPICS:
+            try:
+                r = requests.post(f"https://ntfy.sh/{topic}", data=message.encode("utf-8"),
+                                  headers={"Title": "Ichimoku Cloud Alert", "Priority": "high"},
+                                  timeout=20)
+                print("ntfy", topic, r.status_code)
+            except Exception as e:
+                print("ntfy error:", e)
+        for item in CALLMEBOT_KEYS:
+            phone, key = item.rsplit(":", 1)
+            try:
+                r = requests.get("https://api.callmebot.com/whatsapp.php",
+                                 params={"phone": phone.strip(), "text": message, "apikey": key.strip()},
+                                 timeout=30)
+                print("CallMeBot", phone, r.status_code)
+            except Exception as e:
+                print("CallMeBot error:", e)
+
+    if active_channels():
+        threading.Thread(target=worker, daemon=True).start()
+    else:
+        send_pywhatkit(message)
+
+
 def in_market_hours():
-    return MARKET_START <= now_ist().time() <= MARKET_END
+    t = now_ist()
+    # Mon-Fri only (exchange holidays are not covered)
+    return t.weekday() < 5 and MARKET_START <= t.time() <= MARKET_END
 
 
-def scan():
-    """One pass over every selected index x timeframe."""
+def scan(force=False):
+    """One pass over every selected index x timeframe.
+    force=True (Check now): ignore market hours and send if zone is in the selected zones."""
     cfg = load_json(CONFIG_FILE, DEFAULT_CFG)
     state = load_json(STATE_FILE, {})
     market_open = in_market_hours()
+    test = bot.get("test_mode", False)
+    any_hours = bot.get("ignore_hours", False)
     now = now_ist()
     rows, alerts = [], []
 
@@ -198,13 +269,19 @@ def scan():
                                       ).total_seconds() >= HEARTBEAT_SECONDS
             print(f"[{key}] price={price} cloud=({bottom:.2f}-{top:.2f}) zone={zone} changed={changed}")
 
-            if market_open:
-                if zone in cfg["zones"] and (changed or due):
+            if market_open or test or any_hours or force:
+                if test or (zone in cfg["zones"] and (force or changed or due)):
                     msg = MESSAGES[zone].format(name=name, tf=tf.upper(), price=price,
                                                 cloud_top=round(top, 2), cloud_bottom=round(bottom, 2),
                                                 pct=int(NEAR_PCT * 100))
-                    if not changed:
+                    if test:
+                        msg = "🧪 TEST MODE\n" + msg
+                    elif force:
+                        msg = "🔎 MANUAL CHECK\n" + msg
+                    elif not changed:
                         msg += "\n(periodic update - no change)"
+                    if not market_open:
+                        msg += "\n(market closed - last close price)"
                     alerts.append(msg)
                     s["last_sent"] = now.isoformat()
                     row["alerted"] = True
@@ -213,7 +290,7 @@ def scan():
 
     save_json(STATE_FILE, state)
     if alerts:  # one combined message so browser tabs don't clash
-        send_whatsapp("\n\n".join(alerts))
+        send_alert("\n\n".join(alerts))
     bot["rows"], bot["last_scan"] = rows, now.strftime("%d %b %H:%M:%S")
 
 
@@ -277,6 +354,17 @@ with st.container(border=True):
     }
     ok = all(cfg.values())
 
+    bot["test_mode"] = st.checkbox(
+        "🧪 Test mode: send WhatsApp every 5 min (ignores market hours and zone filter)",
+        value=bot.get("test_mode", False))
+
+    bot["ignore_hours"] = st.checkbox(
+        "Send auto alerts even when market is closed (Start alerts mode)",
+        value=bot.get("ignore_hours", False))
+
+    st.caption("Alert channel: " + (", ".join(active_channels()) or
+               "pywhatkit (works only when this app runs on your own PC)"))
+
     c1, c2, _ = st.columns([1, 1, 6])
 
     if not bot["running"]:
@@ -294,7 +382,7 @@ with st.container(border=True):
     if c2.button("Check now", disabled=not ok, use_container_width=True):
         save_json(CONFIG_FILE, cfg)
         with st.spinner("Checking..."):
-            scan()
+            scan(force=True)
         st.rerun()
 
 if ok and bot["running"]:
@@ -305,7 +393,8 @@ if ok and bot["running"]:
 def live_panel():
     dot = "🟢" if bot["running"] else "⚪"
     state_txt = "Alerts running" if bot["running"] else "Alerts stopped"
-    market = "open" if in_market_hours() else "closed (alerts only 9:15-15:30 IST)"
+    market = ("open" if in_market_hours()
+              else "closed (alerts Mon-Fri 9:15-15:30 IST) - prices shown are the last close")
     st.info(f"{dot} **{state_txt}** · Market {market} · Last scan: {bot['last_scan'] or '-'}")
 
     rows = [r for r in bot["rows"]
@@ -327,7 +416,7 @@ def live_panel():
             data.append({"Index": r["index"], "Timeframe": r["tf"].upper(), "Live price": "",
                          "Cloud bottom": "", "Cloud top": "", "Zone": "", "WhatsApp alert": r["error"]})
             continue
-        alert = ("Sent" if r.get("alerted") else "Watching") if r["zone"] in cfg["zones"] else "-"
+        alert = ("Sent" if r.get("alerted") else "Watching") if (r["zone"] in cfg["zones"] or r.get("alerted")) else "-"
         data.append({
             "Index": r["index"], "Timeframe": r["tf"].upper(),
             "Live price": r["price"], "Cloud bottom": r["bottom"], "Cloud top": r["top"],
@@ -337,6 +426,8 @@ def live_panel():
     df = pd.DataFrame(data)
     label_to_key = {v: k for k, v in ZONES.items()}
     styled = df.style.map(lambda v: ZONE_STYLE.get(label_to_key.get(v), ""), subset=["Zone"])
+    num = lambda v: f"{v:,.2f}" if isinstance(v, (int, float)) else v
+    styled = styled.format(num, subset=["Live price", "Cloud bottom", "Cloud top"])
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
