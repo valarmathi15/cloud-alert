@@ -1,11 +1,13 @@
 """
 Ichimoku Cloud Alerts -> Phone notification (ntfy)  |  single-file Streamlit app
 
-Run locally :  pip install streamlit yfinance pandas requests
+Run locally :  pip install -U streamlit yfinance pandas requests
                python -m streamlit run app.py
 Secrets     :  NTFY_TOPIC = "your-topic-name"   (Streamlit Cloud: Manage app -> Settings -> Secrets)
 Stop alerts :  press Stop in the dashboard, tap the "Action taken" button on a notification,
                or publish the text  action taken  to your ntfy topic.
+Log         :  every notification (time, zone, price, action taken + time) is saved in
+               notification_log.json and shown in the "Notification log" tab.
 """
 import os, json, time, datetime, threading
 import requests
@@ -19,6 +21,8 @@ st.set_page_config(page_title="Ichimoku Cloud Alerts", page_icon="☁️", layou
 CHECK_EVERY_SECONDS = 5 * 60
 STOP_POLL_SECONDS = 10          # how often to look for "action taken" on ntfy
 CONFIG_FILE = "dashboard_config.json"
+LOG_FILE = "notification_log.json"
+LOG_MAX = 2000
 SIGNAL_FILE = "whatsapp_signal.txt"   # local "action taken" file (optional, unchanged)
 
 TENKAN_PERIOD, KIJUN_PERIOD, SENKOU_B_PERIOD, DISPLACEMENT = 9, 26, 52, 26
@@ -65,7 +69,8 @@ DEFAULT_CFG = {"segments": ["NSE"], "indices": ["Nifty 50"], "timeframes": ["4h"
 # Shared state must survive Streamlit reruns -> cache_resource
 @st.cache_resource(show_spinner=False)
 def get_shared():
-    return {"running": False, "last_scan": None, "rows": [], "since": 0}
+    return {"running": False, "last_scan": None, "rows": [], "since": 0,
+            "lock": threading.Lock()}
 
 
 bot = get_shared()
@@ -86,6 +91,10 @@ NTFY_TOPICS = [x.strip() for x in _secret("NTFY_TOPIC").split(",") if x.strip()]
 
 def now_ist():
     return datetime.datetime.now(IST).replace(tzinfo=None)
+
+
+def fmt_ist(ts):
+    return datetime.datetime.fromtimestamp(ts, IST).strftime("%d %b %H:%M:%S")
 
 
 def in_market_hours():
@@ -116,6 +125,28 @@ def check_action_taken_signal() -> bool:
         except Exception:
             pass
     return False
+
+
+# ---------- notification log (saved to file, survives setting changes) ----------
+def log_notifications(entries):
+    if not entries:
+        return
+    with bot["lock"]:
+        log = load_json(LOG_FILE, [])
+        log.extend(entries)
+        save_json(LOG_FILE, log[-LOG_MAX:])
+
+
+def mark_action_taken(action_ts):
+    """Mark the auto notifications of the current run as 'action taken' at action_ts."""
+    with bot["lock"]:
+        log = load_json(LOG_FILE, [])
+        for e in log:
+            if (e.get("kind") == "auto" and not e.get("action_unix")
+                    and bot["since"] <= e.get("sent_unix", 0) <= action_ts + 2):
+                e["action_unix"] = int(action_ts)
+                e["action_at"] = fmt_ist(action_ts)
+        save_json(LOG_FILE, log)
 
 
 # ---------- Ichimoku ----------
@@ -212,7 +243,8 @@ def send_alert(message, with_button=True):
 
 
 def ntfy_stop_requested(since):
-    """True if somebody published 'action taken' to the topic after `since` (unix seconds)."""
+    """Unix time of the latest 'action taken' published to the topic after `since`, else 0."""
+    found = 0
     for topic in NTFY_TOPICS:
         try:
             r = requests.get(f"https://ntfy.sh/{topic}/json",
@@ -224,15 +256,17 @@ def ntfy_stop_requested(since):
                     continue
                 if (m.get("event") == "message" and m.get("time", 0) >= int(since)
                         and "action taken" in str(m.get("message", "")).lower()):
-                    return True
+                    found = max(found, int(m["time"]))
         except Exception as e:
             print("ntfy poll error:", e)
-    return False
+    return found
 
 
-def stop_bot(reason):
+def stop_bot(reason, action_ts=None):
     bot["running"] = False
     print("Alerts stopped:", reason)
+    if action_ts:
+        mark_action_taken(action_ts)
     send_alert("✅ Alerts stopped (" + reason + "). Dashboard-la irundhu thirumba Start pannalaam.",
                with_button=False)
 
@@ -246,7 +280,8 @@ def scan(force=False):
     near = near_pct / 100
     market_open = in_market_hours()
     now = now_ist()
-    rows, alerts = [], []
+    rows, alerts, log_entries = [], [], []
+    sent_ts = int(time.time())
 
     for name in cfg["indices"]:
         price = live_price(INDICES[name])
@@ -277,20 +312,28 @@ def scan(force=False):
                     msg += "\n(market closed - last close price)"
                 alerts.append(msg)
                 row["alerted"] = True
+                log_entries.append({
+                    "sent_unix": sent_ts, "sent_at": fmt_ist(sent_ts), "index": name,
+                    "tf": tf, "zone": zone, "price": price,
+                    "kind": "manual" if force else "auto",
+                    "action_unix": None, "action_at": None})
 
     if alerts:  # one combined notification per scan
         send_alert("\n\n".join(alerts))
+        log_notifications(log_entries)
     bot["rows"], bot["last_scan"] = rows, now.strftime("%d %b %H:%M:%S")
 
 
 def monitor_loop():
     while bot["running"]:
         if check_action_taken_signal():
-            stop_bot("signal file")
+            stop_bot("signal file", time.time())
             break
-        if NTFY_TOPICS and ntfy_stop_requested(bot["since"]):
-            stop_bot("action taken")
-            break
+        if NTFY_TOPICS:
+            ts = ntfy_stop_requested(bot["since"])
+            if ts:
+                stop_bot("action taken", ts)
+                break
         try:
             scan()
         except Exception as e:
@@ -299,9 +342,11 @@ def monitor_loop():
         while bot["running"] and waited < CHECK_EVERY_SECONDS:
             time.sleep(1)
             waited += 1
-            if waited % STOP_POLL_SECONDS == 0 and NTFY_TOPICS and ntfy_stop_requested(bot["since"]):
-                stop_bot("action taken")
-                break
+            if waited % STOP_POLL_SECONDS == 0 and NTFY_TOPICS:
+                ts = ntfy_stop_requested(bot["since"])
+                if ts:
+                    stop_bot("action taken", ts)
+                    break
 
 
 # ====================== STREAMLIT UI ======================
@@ -319,7 +364,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---- session defaults come from the saved config ----
+# ---- session defaults come from the saved config; checkbox states live in session_state ----
 saved = load_json(CONFIG_FILE, DEFAULT_CFG)
 saved_segments = saved.get("segments") or sorted(
     {SEGMENT_OF[i] for i in saved.get("indices", []) if i in SEGMENT_OF}) or ["NSE"]
@@ -333,114 +378,182 @@ try:
     _np = min(10, max(1, int(saved.get("near_pct", 1))))
 except Exception:
     _np = 1
-keep("sel_segments", [x for x in saved_segments if x in SEGMENTS])
-keep("sel_indices", [x for x in saved.get("indices", []) if x in INDICES])
-keep("sel_tfs", [x for x in saved.get("timeframes", []) if x in TFS])
-keep("sel_zones", [x for x in saved.get("zones", []) if x in ZONES])
+for s_ in SEGMENTS:
+    keep(f"seg_{s_}", s_ in saved_segments)
+for n_ in INDICES:
+    keep(f"idx_{n_}", n_ in saved.get("indices", []))
+for t_ in TFS:
+    keep(f"tf_{t_}", t_ in saved.get("timeframes", []))
+for z_ in ZONES:
+    keep(f"zn_{z_}", z_ in saved.get("zones", []))
 keep("near_pct", _np)
 
-with st.container(border=True):
-    # four dropdowns side by side (each has a built-in "Select all" in its list)
-    c_seg, c_idx, c_tf, c_zn, c_np = st.columns([1, 2, 1.3, 1.7, 0.9])
 
-    c_seg.multiselect("Segment", SEGMENTS, key="sel_segments", placeholder="Choose segment")
+def _toggle_all(prefix, values):
+    v = st.session_state[f"{prefix}__all"]
+    for x in values:
+        st.session_state[f"{prefix}_{x}"] = v
 
-    idx_options = [n for n in INDICES if SEGMENT_OF[n] in st.session_state["sel_segments"]]
-    # drop picks that belong to a segment that is no longer selected
-    st.session_state["sel_indices"] = [i for i in st.session_state["sel_indices"] if i in idx_options]
-    c_idx.multiselect("Index", idx_options, key="sel_indices", placeholder="Choose index")
 
-    c_tf.multiselect("Timeframe", list(TFS.keys()), key="sel_tfs",
-                     format_func=lambda x: TFS[x], placeholder="Choose timeframe")
-    c_zn.multiselect("Cloud (alert only when price is)", list(ZONES.keys()), key="sel_zones",
-                     format_func=lambda x: ZONES[x], placeholder="Choose cloud zone")
-    c_np.selectbox("Target %", list(range(1, 11)), key="near_pct",
-                   format_func=lambda x: f"{x}%",
-                   help='How close to the cloud line counts as "Near Cloud Top / Bottom"')
-
-    cfg = {
-        "segments": st.session_state["sel_segments"],
-        "indices": st.session_state["sel_indices"],
-        "timeframes": st.session_state["sel_tfs"],
-        "zones": st.session_state["sel_zones"],
-        "near_pct": int(st.session_state["near_pct"]),
-    }
-    ok = bool(cfg["indices"] and cfg["timeframes"] and cfg["zones"])
-
-    if active_channels():
-        st.caption("Alert channel: " + ", ".join(active_channels()) +
-                   "  ·  Stop: Stop button / notification-la \"Action taken\" button / ntfy-la \"action taken\" nu send pannunga")
+def check_dropdown(col, title, items, prefix):
+    """A dropdown (popover) with a 'Select all' box and one checkbox per option."""
+    values = [v for v, _ in items]
+    chosen = [lbl for v, lbl in items if st.session_state[f"{prefix}_{v}"]]
+    if not chosen:
+        text = "Select..."
+    elif len(chosen) == len(items):
+        text = "All"
+    elif len(chosen) <= 2:
+        text = ", ".join(chosen)
     else:
-        st.warning("NTFY_TOPIC is not set in Secrets - notifications will not be sent.")
-
-    c1, c2, _ = st.columns([1, 1, 6])
-
-    if not bot["running"]:
-        if c1.button("Start alerts", type="primary", disabled=not ok, use_container_width=True):
-            save_json(CONFIG_FILE, cfg)
-            open(SIGNAL_FILE, "w").close()          # clear old local 'action taken'
-            bot["since"] = int(time.time())          # ignore old 'action taken' messages on ntfy
-            bot["running"] = True
-            threading.Thread(target=monitor_loop, daemon=True).start()
-            st.rerun()
-    else:
-        if c1.button("Stop alerts", type="primary", use_container_width=True):
-            bot["running"] = False
-            st.rerun()
-
-    if c2.button("Check now", disabled=not ok, use_container_width=True):
-        save_json(CONFIG_FILE, cfg)
-        with st.spinner("Checking..."):
-            scan(force=True)
-        st.rerun()
-
-if ok and bot["running"]:
-    save_json(CONFIG_FILE, cfg)  # keep saved config in sync while running
+        text = f"{len(chosen)} selected"
+    col.caption(title)
+    with col.popover(text, use_container_width=True):
+        st.session_state[f"{prefix}__all"] = len(chosen) == len(items)
+        st.checkbox("Select all", key=f"{prefix}__all", on_change=_toggle_all, args=(prefix, values))
+        st.divider()
+        for v, lbl in items:
+            st.checkbox(lbl, key=f"{prefix}_{v}")
+    return [v for v in values if st.session_state[f"{prefix}_{v}"]]
 
 
-@st.fragment(run_every=10)
-def live_panel():
-    dot = "🟢" if bot["running"] else "⚪"
-    state_txt = "Alerts running" if bot["running"] else "Alerts stopped"
-    market = ("open" if in_market_hours()
-              else "closed (Mon-Fri 9:15-15:30 IST) - prices shown are the last close")
-    st.info(f"{dot} **{state_txt}** · Market {market} · Last scan: {bot['last_scan'] or '-'}")
+tab_dash, tab_log = st.tabs(["Dashboard", "Notification log"])
 
-    rows = [r for r in bot["rows"]
-            if r["index"] in cfg["indices"] and r["tf"] in cfg["timeframes"]]
-    rows.sort(key=lambda r: (list(INDICES).index(r["index"]), list(TFS).index(r["tf"])))
+with tab_dash:
+    with st.container(border=True):
+        c_seg, c_idx, c_tf, c_zn, c_np = st.columns([1, 1.6, 1.3, 1.6, 0.9])
 
-    if not rows:
-        st.markdown(
-            "<div style='border:1px dashed #D1D5DB;border-radius:10px;padding:32px;"
-            "text-align:center;color:#6B7280'>Choose segment, index, timeframe and cloud zone, "
-            "then press <b>Start alerts</b> or <b>Check now</b>.</div>",
-            unsafe_allow_html=True,
-        )
-        return
+        sel_segments = check_dropdown(c_seg, "Segment", [(s, s) for s in SEGMENTS], "seg")
+        idx_items = [(n, n) for n in INDICES if SEGMENT_OF[n] in sel_segments]
+        sel_indices = check_dropdown(c_idx, "Index", idx_items, "idx") if idx_items else []
+        if not idx_items:
+            c_idx.caption("Index")
+            c_idx.popover("Select segment first", use_container_width=True, disabled=True)
+        sel_tfs = check_dropdown(c_tf, "Timeframe", list(TFS.items()), "tf")
+        sel_zones = check_dropdown(c_zn, "Cloud (alert only when price is)", list(ZONES.items()), "zn")
 
-    data = []
-    for r in rows:
-        if r.get("error"):
-            data.append({"Index": r["index"], "Timeframe": r["tf"].upper(), "Live price": "",
-                         "Cloud bottom": "", "Cloud top": "", "Zone": "", "Notification": r["error"]})
-            continue
-        if r["zone"] in cfg["zones"]:
-            alert = "Sent" if r.get("alerted") else "Watching"
+        c_np.caption("Target %")
+        with c_np.popover(f"{st.session_state['near_pct']}%", use_container_width=True):
+            st.caption('Near Cloud Top / Bottom = price within this % of the cloud line')
+            st.radio("Target %", list(range(1, 11)), key="near_pct",
+                     format_func=lambda x: f"{x}%", label_visibility="collapsed")
+
+        cfg = {
+            "segments": sel_segments,
+            "indices": sel_indices,
+            "timeframes": sel_tfs,
+            "zones": sel_zones,
+            "near_pct": int(st.session_state["near_pct"]),
+        }
+        ok = bool(cfg["indices"] and cfg["timeframes"] and cfg["zones"])
+        if cfg != saved:
+            save_json(CONFIG_FILE, cfg)  # every change is saved
+
+        if active_channels():
+            st.caption("Alert channel: " + ", ".join(active_channels()) +
+                       "  ·  Stop: Stop button / notification-la \"Action taken\" button / ntfy-la \"action taken\" nu send pannunga")
         else:
-            alert = "-"
-        data.append({
-            "Index": r["index"], "Timeframe": r["tf"].upper(),
-            "Live price": r["price"], "Cloud bottom": r["bottom"], "Cloud top": r["top"],
-            "Zone": ZONES[r["zone"]], "Notification": alert,
-        })
+            st.warning("NTFY_TOPIC is not set in Secrets - notifications will not be sent.")
 
-    df = pd.DataFrame(data)
-    label_to_key = {v: k for k, v in ZONES.items()}
-    num = lambda v: f"{v:,.2f}" if isinstance(v, (int, float)) else v
-    styled = (df.style.map(lambda v: ZONE_STYLE.get(label_to_key.get(v), ""), subset=["Zone"])
-                      .format(num, subset=["Live price", "Cloud bottom", "Cloud top"]))
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+        c1, c2, _ = st.columns([1, 1, 6])
 
+        if not bot["running"]:
+            if c1.button("Start alerts", type="primary", disabled=not ok, use_container_width=True):
+                save_json(CONFIG_FILE, cfg)
+                open(SIGNAL_FILE, "w").close()          # clear old local 'action taken'
+                bot["since"] = int(time.time())          # ignore old 'action taken' messages on ntfy
+                bot["running"] = True
+                threading.Thread(target=monitor_loop, daemon=True).start()
+                st.rerun()
+        else:
+            if c1.button("Stop alerts", type="primary", use_container_width=True):
+                bot["running"] = False
+                st.rerun()
 
-live_panel()
+        if c2.button("Check now", disabled=not ok, use_container_width=True):
+            save_json(CONFIG_FILE, cfg)
+            with st.spinner("Checking..."):
+                scan(force=True)
+            st.rerun()
+
+    @st.fragment(run_every=10)
+    def live_panel():
+        dot = "🟢" if bot["running"] else "⚪"
+        state_txt = "Alerts running" if bot["running"] else "Alerts stopped"
+        market = ("open" if in_market_hours()
+                  else "closed (Mon-Fri 9:15-15:30 IST) - prices shown are the last close")
+        st.info(f"{dot} **{state_txt}** · Market {market} · Last scan: {bot['last_scan'] or '-'}")
+
+        rows = [r for r in bot["rows"]
+                if r["index"] in cfg["indices"] and r["tf"] in cfg["timeframes"]]
+        rows.sort(key=lambda r: (list(INDICES).index(r["index"]), list(TFS).index(r["tf"])))
+
+        if not rows:
+            st.markdown(
+                "<div style='border:1px dashed #D1D5DB;border-radius:10px;padding:32px;"
+                "text-align:center;color:#6B7280'>Choose segment, index, timeframe and cloud zone, "
+                "then press <b>Start alerts</b> or <b>Check now</b>.</div>",
+                unsafe_allow_html=True,
+            )
+            return
+
+        data = []
+        for r in rows:
+            if r.get("error"):
+                data.append({"Index": r["index"], "Timeframe": r["tf"].upper(), "Live price": "",
+                             "Cloud bottom": "", "Cloud top": "", "Zone": "", "Notification": r["error"]})
+                continue
+            if r["zone"] in cfg["zones"]:
+                alert = "Sent" if r.get("alerted") else "Watching"
+            else:
+                alert = "-"
+            data.append({
+                "Index": r["index"], "Timeframe": r["tf"].upper(),
+                "Live price": r["price"], "Cloud bottom": r["bottom"], "Cloud top": r["top"],
+                "Zone": ZONES[r["zone"]], "Notification": alert,
+            })
+
+        df = pd.DataFrame(data)
+        label_to_key = {v: k for k, v in ZONES.items()}
+        num = lambda v: f"{v:,.2f}" if isinstance(v, (int, float)) else v
+        styled = (df.style.map(lambda v: ZONE_STYLE.get(label_to_key.get(v), ""), subset=["Zone"])
+                          .format(num, subset=["Live price", "Cloud bottom", "Cloud top"]))
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    live_panel()
+
+with tab_log:
+    @st.fragment(run_every=10)
+    def log_panel():
+        log = load_json(LOG_FILE, [])
+        if not log:
+            st.info("Innum notification poga-la. Pogum bodhu inga time, zone, price, action taken ellam save aagi varum.")
+            return
+        data = []
+        for e in reversed(log):
+            if e.get("kind") == "manual":
+                action, at = "- (manual check)", "-"
+            elif e.get("action_at"):
+                action, at = "Yes", e["action_at"]
+            elif bot["running"] and e.get("sent_unix", 0) >= bot["since"]:
+                action, at = "Pending", "-"
+            else:
+                action, at = "No", "-"
+            data.append({
+                "Sent at (IST)": e.get("sent_at", ""),
+                "Index": e.get("index", ""),
+                "Timeframe": str(e.get("tf", "")).upper(),
+                "Zone": ZONES.get(e.get("zone"), e.get("zone")),
+                "Price": e.get("price"),
+                "Type": "Manual check" if e.get("kind") == "manual" else "Auto",
+                "Action taken": action,
+                "Action time (IST)": at,
+            })
+        df = pd.DataFrame(data)
+        st.caption(f"{len(df)} notifications saved (newest first)")
+        st.dataframe(df.style.format({"Price": lambda v: f"{v:,.2f}" if isinstance(v, (int, float)) else v}),
+                     use_container_width=True, hide_index=True)
+        st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"),
+                           file_name="notification_log.csv", mime="text/csv", key="dl_log")
+
+    log_panel()
