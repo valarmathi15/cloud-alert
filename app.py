@@ -207,13 +207,19 @@ def classify_zone(price, cloud_top, cloud_bottom, near):
     return "inside"
 
 
-MESSAGES = {
-    "near_bottom": "🟠 {name} ({tf})\nCloud BOTTOM line-ku {pct}% arukila vandhuduchu -> cloud-ku keela vara pogudhu!\nLive price: {price}\nCloud bottom: {cloud_bottom}",
-    "below": "🔴 {name} ({tf}) - BELOW CLOUD\nLive price cloud-ku keela POYIDUCHU!\nLive price: {price}\nCloud: {cloud_bottom} - {cloud_top}",
-    "near_top": "🟡 {name} ({tf})\nCloud TOP line-ku {pct}% arukila vandhuduchu -> cloud-ku mela poga pogudhu!\nLive price: {price}\nCloud top: {cloud_top}",
-    "above": "🟢 {name} ({tf}) - ABOVE CLOUD\nLive price cloud-ku mela POYIDUCHU!\nLive price: {price}\nCloud: {cloud_bottom} - {cloud_top}",
-    "inside": "⚪ {name} ({tf})\nCloud-ku ULLA irukku, neither zone-um illa (neutral).\nLive price: {price}\nCloud: {cloud_bottom} - {cloud_top}",
-}
+def build_message(name, tf, price, top, bottom, zone, selected_zones, near_pct):
+    """Tells the current zone and, for every selected zone, whether the price is in it or not."""
+    in_any = zone in selected_zones
+    lines = [f"{'✅' if in_any else '❌'} {name} ({tf.upper()})",
+             f"Live price: {price:,.2f}",
+             f"Cloud: {bottom:,.2f} - {top:,.2f}",
+             f"Ippo irukkura zone: {ZONES[zone]}"]
+    for z in ZONES:  # keep a fixed order
+        if z not in selected_zones:
+            continue
+        label = ZONES[z] + (f" ({near_pct}%)" if z in ("near_top", "near_bottom") else "")
+        lines.append(f"{'✅' if z == zone else '❌'} {label} - {'IRUKKU' if z == zone else 'ILLA'}")
+    return "\n".join(lines)
 
 
 # ---------- ntfy ----------
@@ -274,7 +280,7 @@ def stop_bot(reason, action_ts=None):
 # ---------- scan / loop ----------
 def scan(force=False):
     """One pass over every selected index x timeframe.
-    Notification goes out only when the price is in one of the selected zones."""
+    Every scan sends a notification saying whether the price is IN or NOT IN each selected zone."""
     cfg = load_json(CONFIG_FILE, DEFAULT_CFG)
     near_pct = int(cfg.get("near_pct", 1))
     near = near_pct / 100
@@ -302,21 +308,19 @@ def scan(force=False):
             row.update(zone=zone, top=round(top, 2), bottom=round(bottom, 2))
             print(f"[{name}|{tf}] price={price} cloud=({bottom:.2f}-{top:.2f}) zone={zone}")
 
-            if zone in cfg["zones"]:  # only the zones the user selected
-                msg = MESSAGES[zone].format(name=name, tf=tf.upper(), price=price,
-                                            cloud_top=round(top, 2), cloud_bottom=round(bottom, 2),
-                                            pct=near_pct)
-                if force:
-                    msg = "🔎 MANUAL CHECK\n" + msg
-                if not market_open:
-                    msg += "\n(market closed - last close price)"
-                alerts.append(msg)
-                row["alerted"] = True
-                log_entries.append({
-                    "sent_unix": sent_ts, "sent_at": fmt_ist(sent_ts), "index": name,
-                    "tf": tf, "zone": zone, "price": price,
-                    "kind": "manual" if force else "auto",
-                    "action_unix": None, "action_at": None})
+            matched = zone in cfg["zones"]
+            msg = build_message(name, tf, price, top, bottom, zone, cfg["zones"], near_pct)
+            if force:
+                msg = "🔎 MANUAL CHECK\n" + msg
+            if not market_open:
+                msg += "\n(market closed - last close price)"
+            alerts.append(msg)
+            row["alerted"], row["matched"] = True, matched
+            log_entries.append({
+                "sent_unix": sent_ts, "sent_at": fmt_ist(sent_ts), "index": name,
+                "tf": tf, "zone": zone, "price": price, "matched": matched,
+                "kind": "manual" if force else "auto",
+                "action_unix": None, "action_at": None})
 
     if alerts:  # one combined notification per scan
         send_alert("\n\n".join(alerts))
@@ -503,10 +507,10 @@ with tab_dash:
                 data.append({"Index": r["index"], "Timeframe": r["tf"].upper(), "Live price": "",
                              "Cloud bottom": "", "Cloud top": "", "Zone": "", "Notification": r["error"]})
                 continue
-            if r["zone"] in cfg["zones"]:
-                alert = "Sent" if r.get("alerted") else "Watching"
+            if r.get("alerted"):
+                alert = "Sent - in selected zone" if r.get("matched") else "Sent - not in selected zone"
             else:
-                alert = "-"
+                alert = "Watching"
             data.append({
                 "Index": r["index"], "Timeframe": r["tf"].upper(),
                 "Live price": r["price"], "Cloud bottom": r["bottom"], "Cloud top": r["top"],
@@ -543,7 +547,8 @@ with tab_log:
                 "Sent at (IST)": e.get("sent_at", ""),
                 "Index": e.get("index", ""),
                 "Timeframe": str(e.get("tf", "")).upper(),
-                "Zone": ZONES.get(e.get("zone"), e.get("zone")),
+                "Current zone": ZONES.get(e.get("zone"), e.get("zone")),
+                "In selected zone": "Yes" if e.get("matched", True) else "No",
                 "Price": e.get("price"),
                 "Type": "Manual check" if e.get("kind") == "manual" else "Auto",
                 "Action taken": action,
