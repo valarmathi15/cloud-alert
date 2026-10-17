@@ -1,10 +1,9 @@
 """
-Ichimoku Cloud Alerts -> WhatsApp  (single-file Streamlit app)
+Ichimoku Cloud Alerts -> Phone notification (ntfy)  |  single-file Streamlit app
 
-Local run :  pip install streamlit yfinance pandas pywhatkit
-             python -m streamlit run app.py
-Cloud run :  requirements.txt = streamlit, yfinance, pandas
-             (dashboard works; WhatsApp via pywhatkit only works on a PC with Chrome + WhatsApp Web)
+Run locally :  pip install streamlit yfinance pandas requests
+               python -m streamlit run app.py
+Secrets     :  NTFY_TOPIC = "your-topic-name"   (Streamlit Cloud: Manage app -> Settings -> Secrets)
 """
 import os, json, time, datetime, threading
 import requests
@@ -15,7 +14,6 @@ import streamlit as st
 st.set_page_config(page_title="Ichimoku Cloud Alerts", page_icon="☁️", layout="wide")
 
 # ============ CONFIG ============
-WHATSAPP_NUMBER = "+916381316654"
 CHECK_EVERY_SECONDS = 5 * 60
 HEARTBEAT_SECONDS = 30 * 60
 NEAR_PCT = 0.01
@@ -62,13 +60,8 @@ def _secret(name, default=""):
         return default
 
 
-# Cloud-friendly alert channels (set in Streamlit "Secrets"; see instructions)
-TELEGRAM_BOT_TOKEN = _secret("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_IDS = [x.strip() for x in _secret("TELEGRAM_CHAT_IDS").split(",") if x.strip()]
 # NTFY_TOPIC: plain phone push notification (install the free "ntfy" app and subscribe to the same topic)
 NTFY_TOPICS = [x.strip() for x in _secret("NTFY_TOPIC").split(",") if x.strip()]
-# CALLMEBOT_KEYS format:  "+9190000000:apikey1,+9180000000:apikey2"
-CALLMEBOT_KEYS = [x.strip() for x in _secret("CALLMEBOT_KEYS").split(",") if ":" in x]
 
 
 def now_ist():
@@ -167,42 +160,13 @@ MESSAGES = {
 }
 
 
-def send_pywhatkit(message):
-    def worker():
-        with send_lock:  # pywhatkit is slow, so send one message at a time
-            send_time = datetime.datetime.now() + datetime.timedelta(minutes=3)
-            try:
-                import pywhatkit as kit  # works only on a PC with Chrome + WhatsApp Web
-                kit.sendwhatmsg(WHATSAPP_NUMBER, message, send_time.hour, send_time.minute,
-                                wait_time=30, tab_close=True)
-                print("WhatsApp message scheduled successfully.")
-            except Exception as e:
-                print(f"Error sending WhatsApp message: {e}")
-    threading.Thread(target=worker, daemon=True).start()
-
-
 def active_channels():
-    ch = []
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS:
-        ch.append(f"Telegram ({len(TELEGRAM_CHAT_IDS)} chat)")
-    if CALLMEBOT_KEYS:
-        ch.append(f"WhatsApp-CallMeBot ({len(CALLMEBOT_KEYS)} number)")
-    if NTFY_TOPICS:
-        ch.append("Phone notification (ntfy)")
-    return ch
+    return ["Phone notification (ntfy)"] if NTFY_TOPICS else []
 
 
 def send_alert(message):
-    """Cloud channels if configured, otherwise fall back to pywhatkit (local PC only)."""
+    """Send a push notification through ntfy."""
     def worker():
-        for cid in TELEGRAM_CHAT_IDS if TELEGRAM_BOT_TOKEN else []:
-            try:
-                r = requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                    data={"chat_id": cid, "text": message}, timeout=20)
-                print("Telegram", cid, r.status_code)
-            except Exception as e:
-                print("Telegram error:", e)
         for topic in NTFY_TOPICS:
             try:
                 r = requests.post(f"https://ntfy.sh/{topic}", data=message.encode("utf-8"),
@@ -211,20 +175,11 @@ def send_alert(message):
                 print("ntfy", topic, r.status_code)
             except Exception as e:
                 print("ntfy error:", e)
-        for item in CALLMEBOT_KEYS:
-            phone, key = item.rsplit(":", 1)
-            try:
-                r = requests.get("https://api.callmebot.com/whatsapp.php",
-                                 params={"phone": phone.strip(), "text": message, "apikey": key.strip()},
-                                 timeout=30)
-                print("CallMeBot", phone, r.status_code)
-            except Exception as e:
-                print("CallMeBot error:", e)
 
-    if active_channels():
+    if NTFY_TOPICS:
         threading.Thread(target=worker, daemon=True).start()
     else:
-        send_pywhatkit(message)
+        print("No NTFY_TOPIC set - notification not sent")
 
 
 def in_market_hours():
@@ -330,7 +285,7 @@ ZONE_STYLE = {
 
 st.markdown(
     "<div style='background:#131B3B;padding:18px 22px;border-radius:10px;margin-bottom:18px'>"
-    "<h2 style='color:#fff;margin:0;font-size:22px'>Ichimoku Cloud Alerts &rarr; WhatsApp</h2></div>",
+    "<h2 style='color:#fff;margin:0;font-size:22px'>Ichimoku Cloud Alerts &rarr; Phone Notification</h2></div>",
     unsafe_allow_html=True,
 )
 
@@ -355,15 +310,17 @@ with st.container(border=True):
     ok = all(cfg.values())
 
     bot["test_mode"] = st.checkbox(
-        "🧪 Test mode: send WhatsApp every 5 min (ignores market hours and zone filter)",
+        "🧪 Test mode: send notification every 5 min (ignores market hours and zone filter)",
         value=bot.get("test_mode", False))
 
     bot["ignore_hours"] = st.checkbox(
         "Send auto alerts even when market is closed (Start alerts mode)",
         value=bot.get("ignore_hours", False))
 
-    st.caption("Alert channel: " + (", ".join(active_channels()) or
-               "pywhatkit (works only when this app runs on your own PC)"))
+    if active_channels():
+        st.caption("Alert channel: " + ", ".join(active_channels()))
+    else:
+        st.warning("NTFY_TOPIC is not set in Secrets - notifications will not be sent.")
 
     c1, c2, _ = st.columns([1, 1, 6])
 
@@ -414,13 +371,13 @@ def live_panel():
     for r in rows:
         if r.get("error"):
             data.append({"Index": r["index"], "Timeframe": r["tf"].upper(), "Live price": "",
-                         "Cloud bottom": "", "Cloud top": "", "Zone": "", "WhatsApp alert": r["error"]})
+                         "Cloud bottom": "", "Cloud top": "", "Zone": "", "Notification": r["error"]})
             continue
         alert = ("Sent" if r.get("alerted") else "Watching") if (r["zone"] in cfg["zones"] or r.get("alerted")) else "-"
         data.append({
             "Index": r["index"], "Timeframe": r["tf"].upper(),
             "Live price": r["price"], "Cloud bottom": r["bottom"], "Cloud top": r["top"],
-            "Zone": ZONES[r["zone"]], "WhatsApp alert": alert,
+            "Zone": ZONES[r["zone"]], "Notification": alert,
         })
 
     df = pd.DataFrame(data)
