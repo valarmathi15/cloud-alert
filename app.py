@@ -207,13 +207,22 @@ def classify_zone(price, cloud_top, cloud_bottom, near):
     return "inside"
 
 
+def zone_status(zone, selected_zones, near_pct=None):
+    """Only the zones the user selected, each marked in (✅) or not in (❌)."""
+    parts = []
+    for z in ZONES:  # fixed order
+        if z in selected_zones:
+            label = ZONES[z] + (f" ({near_pct}%)" if near_pct and z in ("near_top", "near_bottom") else "")
+            parts.append(f"{'✅' if z == zone else '❌'} {label}")
+    return " | ".join(parts)
+
+
 def build_message(name, tf, price, top, bottom, zone, selected_zones, near_pct):
     """Tells the current zone and, for every selected zone, whether the price is in it or not."""
     in_any = zone in selected_zones
     lines = [f"{'✅' if in_any else '❌'} {name} ({tf.upper()})",
              f"Live price: {price:,.2f}",
-             f"Cloud: {bottom:,.2f} - {top:,.2f}",
-             f"Ippo irukkura zone: {ZONES[zone]}"]
+             f"Cloud: {bottom:,.2f} - {top:,.2f}"]
     for z in ZONES:  # keep a fixed order
         if z not in selected_zones:
             continue
@@ -315,10 +324,11 @@ def scan(force=False):
             if not market_open:
                 msg += "\n(market closed - last close price)"
             alerts.append(msg)
-            row["alerted"], row["matched"] = True, matched
+            status = zone_status(zone, cfg["zones"], near_pct)
+            row["alerted"], row["matched"], row["status"] = True, matched, status
             log_entries.append({
                 "sent_unix": sent_ts, "sent_at": fmt_ist(sent_ts), "index": name,
-                "tf": tf, "zone": zone, "price": price, "matched": matched,
+                "tf": tf, "zone": zone, "price": price, "matched": matched, "status": status,
                 "kind": "manual" if force else "auto",
                 "action_unix": None, "action_at": None})
 
@@ -412,7 +422,7 @@ def check_dropdown(col, title, items, prefix):
     else:
         text = f"{len(chosen)} selected"
     col.caption(title)
-    with col.popover(text, use_container_width=True):
+    with col.popover(text, width="stretch"):
         st.session_state[f"{prefix}__all"] = len(chosen) == len(items)
         st.checkbox("Select all", key=f"{prefix}__all", on_change=_toggle_all, args=(prefix, values))
         st.divider()
@@ -432,12 +442,12 @@ with tab_dash:
         sel_indices = check_dropdown(c_idx, "Index", idx_items, "idx") if idx_items else []
         if not idx_items:
             c_idx.caption("Index")
-            c_idx.popover("Select segment first", use_container_width=True, disabled=True)
+            c_idx.popover("Select segment first", width="stretch", disabled=True)
         sel_tfs = check_dropdown(c_tf, "Timeframe", list(TFS.items()), "tf")
         sel_zones = check_dropdown(c_zn, "Cloud (alert only when price is)", list(ZONES.items()), "zn")
 
         c_np.caption("Target %")
-        with c_np.popover(f"{st.session_state['near_pct']}%", use_container_width=True):
+        with c_np.popover(f"{st.session_state['near_pct']}%", width="stretch"):
             st.caption('Near Cloud Top / Bottom = price within this % of the cloud line')
             st.radio("Target %", list(range(1, 11)), key="near_pct",
                      format_func=lambda x: f"{x}%", label_visibility="collapsed")
@@ -462,7 +472,7 @@ with tab_dash:
         c1, c2, _ = st.columns([1, 1, 6])
 
         if not bot["running"]:
-            if c1.button("Start alerts", type="primary", disabled=not ok, use_container_width=True):
+            if c1.button("Start alerts", type="primary", disabled=not ok, width="stretch"):
                 save_json(CONFIG_FILE, cfg)
                 open(SIGNAL_FILE, "w").close()          # clear old local 'action taken'
                 bot["since"] = int(time.time())          # ignore old 'action taken' messages on ntfy
@@ -470,11 +480,11 @@ with tab_dash:
                 threading.Thread(target=monitor_loop, daemon=True).start()
                 st.rerun()
         else:
-            if c1.button("Stop alerts", type="primary", use_container_width=True):
+            if c1.button("Stop alerts", type="primary", width="stretch"):
                 bot["running"] = False
                 st.rerun()
 
-        if c2.button("Check now", disabled=not ok, use_container_width=True):
+        if c2.button("Check now", disabled=not ok, width="stretch"):
             save_json(CONFIG_FILE, cfg)
             with st.spinner("Checking..."):
                 scan(force=True)
@@ -505,7 +515,7 @@ with tab_dash:
         for r in rows:
             if r.get("error"):
                 data.append({"Index": r["index"], "Timeframe": r["tf"].upper(), "Live price": "",
-                             "Cloud bottom": "", "Cloud top": "", "Zone": "", "Notification": r["error"]})
+                             "Cloud bottom": "", "Cloud top": "", "Selected zone": "", "Notification": r["error"]})
                 continue
             if r.get("alerted"):
                 alert = "Sent - in selected zone" if r.get("matched") else "Sent - not in selected zone"
@@ -514,15 +524,16 @@ with tab_dash:
             data.append({
                 "Index": r["index"], "Timeframe": r["tf"].upper(),
                 "Live price": r["price"], "Cloud bottom": r["bottom"], "Cloud top": r["top"],
-                "Zone": ZONES[r["zone"]], "Notification": alert,
+                "Selected zone": r.get("status", ""), "Notification": alert,
             })
 
         df = pd.DataFrame(data)
-        label_to_key = {v: k for k, v in ZONES.items()}
         num = lambda v: f"{v:,.2f}" if isinstance(v, (int, float)) else v
-        styled = (df.style.map(lambda v: ZONE_STYLE.get(label_to_key.get(v), ""), subset=["Zone"])
+        paint = lambda v: (ZONE_STYLE["above"] if "✅" in str(v)
+                           else ZONE_STYLE["below"] if "❌" in str(v) else "")
+        styled = (df.style.map(paint, subset=["Selected zone"])
                           .format(num, subset=["Live price", "Cloud bottom", "Cloud top"]))
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        st.dataframe(styled, width="stretch", hide_index=True)
 
     live_panel()
 
@@ -547,7 +558,7 @@ with tab_log:
                 "Sent at (IST)": e.get("sent_at", ""),
                 "Index": e.get("index", ""),
                 "Timeframe": str(e.get("tf", "")).upper(),
-                "Current zone": ZONES.get(e.get("zone"), e.get("zone")),
+                "Selected zone": e.get("status") or ZONES.get(e.get("zone"), e.get("zone")),
                 "In selected zone": "Yes" if e.get("matched", True) else "No",
                 "Price": e.get("price"),
                 "Type": "Manual check" if e.get("kind") == "manual" else "Auto",
@@ -557,7 +568,7 @@ with tab_log:
         df = pd.DataFrame(data)
         st.caption(f"{len(df)} notifications saved (newest first)")
         st.dataframe(df.style.format({"Price": lambda v: f"{v:,.2f}" if isinstance(v, (int, float)) else v}),
-                     use_container_width=True, hide_index=True)
+                     width="stretch", hide_index=True)
         st.download_button("Download CSV", df.to_csv(index=False).encode("utf-8"),
                            file_name="notification_log.csv", mime="text/csv", key="dl_log")
 
